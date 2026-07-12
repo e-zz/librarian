@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.env
+.pipeline_async.lock
+.pipeline_state*.json
+ragflow_upload_state.json
+_raw/
+downloads/
+pdfs/
+tickets/
+WAYFINDER-MAP.md
+build/
+dist/
+*.egg-info/
+*.egg-info

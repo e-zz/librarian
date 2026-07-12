@@ -1,0 +1,82 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# pyproject.toml — librarian
+# ═══════════════════════════════════════════════════════════════════════════════
+# An end-to-end academic paper pipeline: discover, download, OCR with MinerU,
+# and upload to RAGFlow or NotebookLM.
+#
+# Scripts live under scripts/ and are exposed as CLI tools via console_scripts
+# entry points. Each entry point points to a script's main() function.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+# ── Project Metadata ──────────────────────────────────────────────────────────
+
+[project]
+name = "librarian"
+version = "0.1.0"
+description = "End-to-end academic paper pipeline — discover, download, OCR with MinerU, upload to RAGFlow/NotebookLM"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [
+    { name = "e-zz", email = "e-zz@users.noreply.github.com" }
+]
+
+# Core dependency — all scripts use requests for HTTP API calls and downloads
+dependencies = [
+    "requests>=2.28",
+]
+
+# Optional dependency groups — install with pip install librarian[extra]
+[project.optional-dependencies]
+# CloakBrowser is needed for:
+#   - gs_full_scrape.py  (Google Scholar profile scraping)
+#   - scihub_downloader.py (Sci-Hub / PMC PDF download)
+cloakbrowser = ["cloakbrowser"]
+
+# notebooklm-py is needed for uploading parsed Markdown to Google NotebookLM
+notebooklm = ["notebooklm-py"]
+
+# ── CLI Entry Points ──────────────────────────────────────────────────────────
+# Each maps to the script's main() function, verified against actual source.
+# Scripts are under scripts/, configured as the package directory below.
+#
+# Verified main() functions in source files:
+#   scripts/deposit.py           → def main()
+#   scripts/mineru_api.py        → def main()
+#   scripts/pdf_downloader.py    → def main()
+#   scripts/pipeline_async.py    → def main()
+#   scripts/ragflow_uploader.py  → def main()
+#   scripts/gs_full_scrape.py    → async def async_main()
+#   scripts/scihub_downloader.py → def main()
+#   scripts/zotero_linked_pipeline.py → def main()  (no CLI entry — Zotero bridge)
+#   scripts/_ragflow_client.py   → no main() (internal shared module)
+[project.scripts]
+mineru-api       = "mineru_api:main"
+pdf-downloader   = "pdf_downloader:main"
+pipeline-async   = "pipeline_async:main"
+ragflow-upload   = "ragflow_uploader:main"
+gs-scrape        = "gs_full_scrape:main"
+scihub-download  = "scihub_downloader:main"
+deposit          = "deposit:main"
+zotero-pipeline  = "zotero_linked_pipeline:main"
+
+# ── Package Discovery ─────────────────────────────────────────────────────────
+
+[tool.setuptools.package-dir]
+# Map the root namespace to the scripts/ directory so that imports like
+#   from mineru_api import ...
+# work correctly both when installed and when run from source.
+"" = "scripts"
+
+[tool.setuptools]
+# Each .py file in scripts/ is a standalone module, not part of a package.
+# List them explicitly so setuptools includes them in the wheel.
+py-modules = [
+    "mineru_api", "pdf_downloader", "pipeline_async",
+    "ragflow_uploader", "gs_full_scrape", "scihub_downloader",
+    "zotero_linked_pipeline", "_ragflow_client", "deposit",
+]
