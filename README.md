@@ -5,10 +5,17 @@
 
 **End-to-end academic paper pipeline — discover, download, OCR with MinerU, and upload to RAGFlow or NotebookLM.**
 
+Install in seconds, then use `librarian` for the default workflow or pick any tool for a custom pipeline.
+
 ```bash
 pip install librarian
 cp .env.example .env              # set MINERU_TOKEN (or skip — free tier works without it)
 librarian 2311.08990              # arXiv ID → download → OCR → markdown in one command
+
+# Or build your own pipeline with individual tools:
+mineru-api parse paper.pdf        # just OCR
+pdf-downloader 2311.08990         # just download
+ragflow-upload upload ./_raw/...  # just upload
 ```
 
 ## ✨ Features

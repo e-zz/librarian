@@ -51,7 +51,16 @@ librarian paper.pdf
 
 No `.env` file needed for papers ≤20pp (free MinerU v1 API). Output goes to `./_raw/<paper_name>/` as Markdown.
 
-For advanced usage, each step is also available as a standalone CLI tool (see Scripts Reference below).
+For advanced usage, each step is also available as a standalone CLI tool — swap, skip, or extend any stage:
+
+```bash
+mineru-api parse paper.pdf          # just OCR
+pdf-downloader 2311.08990           # just download
+ragflow-upload upload ./_raw <id>   # just upload
+pipeline-async process pdfs/*.pdf   # batch OCR → RAGFlow
+```
+
+See [Scripts Reference](#scripts-reference) below for every tool.
 
 ## .env Reference
 
