@@ -198,6 +198,18 @@ zotero-pipeline --collection "quantum-chemistry" --dataset-id <id>
 
 Alternatively, `pdf-downloader --zotero` can download a single paper and auto-create its Zotero entry in one step.
 
+### 10. `librarian_pipeline.py` — One-Shot End-to-End Pipeline (CLI: `librarian`)
+
+Accepts arXiv IDs, DOIs, or local PDFs and runs the full download → OCR workflow. Best starting point for new users.
+
+```bash
+librarian 2311.08990                  # arXiv ID → download → OCR
+librarian 10.1007/s42484-025-00254-8  # DOI → download → OCR
+librarian paper.pdf                    # local PDF → OCR
+librarian --input ids.txt             # batch from file
+librarian --demo                       # try with a real paper
+```
+
 ## Workflows
 
 ### Standalone OCR (No External Services)

@@ -63,6 +63,7 @@ gs-scrape        = "gs_full_scrape:main"
 scihub-download  = "scihub_downloader:main"
 deposit          = "deposit:main"
 zotero-pipeline  = "zotero_linked_pipeline:main"
+librarian        = "librarian_pipeline:main"
 
 # ── Package Discovery ─────────────────────────────────────────────────────────
 
@@ -79,4 +80,5 @@ py-modules = [
     "mineru_api", "pdf_downloader", "pipeline_async",
     "ragflow_uploader", "gs_full_scrape", "scihub_downloader",
     "zotero_linked_pipeline", "_ragflow_client", "deposit",
+    "librarian_pipeline",
 ]
