@@ -7,11 +7,8 @@
 
 ```bash
 pip install librarian
-# Set your token via .env (auto-read) or export:
-cp .env.example .env   # then edit .env with your MINERU_TOKEN
-# Or:
-export MINERU_TOKEN=tk_xxxxxxxxxx
-mineru-api parse paper.pdf    # Parse a PDF to Markdown in one command
+cp .env.example .env              # set MINERU_TOKEN (or skip — free tier works without it)
+librarian 2311.08990              # arXiv ID → download → OCR → markdown in one command
 ```
 
 ## ✨ Features
@@ -44,12 +41,22 @@ cp .env.example .env
 # Edit .env with your MinerU API token
 ```
 
-### 3. Parse a PDF
+### 3. Run the pipeline
+
+One command handles download (arXiv/DOI) + OCR:
 
 ```bash
-# Token from .env is auto-read. Or set via export:
-export MINERU_TOKEN=tk_xxxxxxxxxx
-mineru-api parse paper.pdf
+# Download + OCR an arXiv paper in one shot:
+librarian 2311.08990
+
+# Or a DOI:
+librarian 10.1007/s42484-025-00254-8
+
+# Or a local PDF:
+librarian paper.pdf
+
+# Try with a sample paper (no API key needed):
+librarian --demo
 ```
 
 Output goes to `./_raw/<paper_name>/` as clean Markdown.
@@ -58,6 +65,7 @@ Output goes to `./_raw/<paper_name>/` as clean Markdown.
 
 | Command | Script | Description |
 |---|---|---|
+| `librarian` | `librarian_pipeline.py` | **One-shot pipeline** — download + OCR (default workflow) |
 | `mineru-api` | `mineru_api.py` | Parse PDF(s) to Markdown via MinerU Cloud API |
 | `pdf-downloader` | `pdf_downloader.py` | Download PDFs by DOI/arXiv ID with metadata |
 | `pipeline-async` | `pipeline_async.py` | Batch OCR pipeline with optional RAGFlow upload |
@@ -65,15 +73,14 @@ Output goes to `./_raw/<paper_name>/` as clean Markdown.
 | `gs-scrape` | `gs_full_scrape.py` | Scrape Google Scholar profile for publications |
 | `scihub-download` | `scihub_downloader.py` | Extract/download PDFs from Sci-Hub/PMC |
 | `deposit` | `deposit.py` | Place files into managed library with manifest |
-| *(no CLI)* | `zotero_linked_pipeline.py` | Bridge Zotero collection → pipeline |
-| *(internal)* | `_ragflow_client.py` | Shared RAGFlow API client (imported by others) |
+| `zotero-pipeline` | `zotero_linked_pipeline.py` | Bridge Zotero collection → pipeline |
 
 ## 🔧 Workflows
 
 ### Standalone OCR
 
 ```bash
-mineru-api paper.pdf
+mineru-api parse paper.pdf
 ```
 
 ### RAGFlow Pipeline

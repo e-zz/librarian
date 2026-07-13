@@ -33,19 +33,25 @@ What you need:
 | **CloakBrowser** (optional) | GS scraping + Sci-Hub download. Paid license required | [docs/setup-guide.md](docs/setup-guide.md) → CloakBrowser |
 | **Zotero** (optional) | Reference library bridge. Requires desktop + cookjohn plugin | [docs/setup-guide.md](docs/setup-guide.md) → Zotero |
 
+
 ## Quick Start — "Parse a PDF with one command"
 
-Standalone OCR, no external services needed beyond MinerU:
+The fastest path from zero to markdown:
 
 ```bash
-# 1. Set your MinerU token (or use .env)
-export MINERU_TOKEN=tk_xxxxxxxxxx
+# Install
+pip install librarian
 
-# 2. Parse a PDF to Markdown
-mineru-api parse path/to/paper.pdf
+# Run the pipeline on an arXiv paper (auto-downloads + OCRs):
+librarian 2311.08990
+
+# Or a local PDF:
+librarian paper.pdf
 ```
 
-Output written to `./_raw/<paper_name>/` as Markdown with embedded images.
+No `.env` file needed for papers ≤20pp (free MinerU v1 API). Output goes to `./_raw/<paper_name>/` as Markdown.
+
+For advanced usage, each step is also available as a standalone CLI tool (see Scripts Reference below).
 
 ## .env Reference
 
