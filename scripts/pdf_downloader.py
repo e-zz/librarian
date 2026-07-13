@@ -36,8 +36,9 @@ import re
 import sys
 import threading
 import time
-import urllib.error
 import urllib.request
+import urllib.error
+import urllib.parse
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -483,12 +484,50 @@ def fetch_arxiv_metadata(arxiv_id: str) -> dict | None:
         return None
 
 
+# ── Publisher PDF link helpers ───────────────────────────────────────
+
+
+def _is_pdf_link(link: dict) -> bool:
+    """Check if a CrossRef link entry points to a PDF.
+
+    CrossRef's ``link`` array may report content-type as
+    ``"application/pdf"`` explicitly, or use a URL pattern that
+    implies a PDF (``.pdf`` extension, ``/pdf/`` path segment, etc.).
+
+    Some publishers (e.g. RSC) set content-type to ``"unspecified"``
+    even for direct PDF URLs, so the URL-pattern check is essential.
+    """
+    ct = (link.get("content-type") or "").lower()
+    url = link.get("URL", "")
+    if ct == "application/pdf":
+        return True
+    if re.search(r"\.pdf(?:[?#]|$)|/[a-z]*pdf(?:[/?#]|$)", url, re.I):
+        return True
+    return False
+
+
+def _get_publisher_pdf_urls(work: dict) -> list[str]:
+    """Extract PDF URLs from a CrossRef work's ``link`` array.
+
+    Publishers often provide direct PDF URLs in the CrossRef record.
+    These are checked *before* falling back to arXiv, and can be used
+    by ``pdf_downloader`` or ``zotero_linked_pipeline`` for direct
+    download when the paper isn't on arXiv.
+    """
+    urls = []
+    for link in work.get("link", []):
+        if _is_pdf_link(link):
+            urls.append(link.get("URL", ""))
+    return urls
+
+
 def fetch_doi_metadata(doi: str) -> dict | None:
     """Fetch full metadata from the CrossRef API for a given DOI.
 
     CrossRef provides the richest metadata of any free resolution service:
     journal name, volume, issue, pages, DOI, ISBN/ISSN, publisher, language,
     document type, conference name, thesis institution, and more.
+    Also extracts publisher-provided PDF links for direct download.
 
     The User-Agent header is set to CONTACT_EMAIL (configurable via the
     CONTACT_EMAIL environment variable) as a courtesy to CrossRef.
@@ -499,7 +538,8 @@ def fetch_doi_metadata(doi: str) -> dict | None:
     Returns:
         A dict with bibliographic fields including title, authors, abstract,
         year, journal, DOI, type, subtype, volume, issue, pages, publisher,
-        ISBN, ISSN, language, URL, university, conferenceName.
+        ISBN, ISSN, language, URL, university, conferenceName,
+        and publisher_pdf_urls.
         Returns None on failure.
     """
     url = f"https://api.crossref.org/works/{doi}"
@@ -522,7 +562,8 @@ def fetch_doi_metadata(doi: str) -> dict | None:
             if title_list else ""
         )
 
-        abstract = (msg.get("abstract", "") or "").strip().replace('\n', ' ')
+        # Strip HTML tags (CrossRef sometimes returns <p>/<i>/<sub> in abstracts)
+        abstract = re.sub(r'<[^>]+>', '', ((msg.get("abstract", "") or "").strip().replace('\n', ' ')))
 
         # Extract year from various date fields (CrossRef returns an array
         # of [year, month, day] parts for each date type)
@@ -597,6 +638,11 @@ def fetch_doi_metadata(doi: str) -> dict | None:
 
         # URL (prefer the DOI-resolved URL)
         result['url'] = msg.get("URL", f"https://doi.org/{doi}")
+
+        # Publisher PDF URLs from CrossRef link array
+        pub_urls = _get_publisher_pdf_urls(msg)
+        if pub_urls:
+            result['publisher_pdf_urls'] = pub_urls
 
         # Thesis-specific: university from institution field
         institutions = msg.get("institution", [])
