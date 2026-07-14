@@ -84,6 +84,8 @@ Output goes to `./_raw/<paper_name>/` as clean Markdown.
 
 ## 🔧 Workflows
 
+See [docs/dataflows.md](docs/dataflows.md) for detailed dataflow diagrams of every pipeline path. Quick reference:
+
 ### Standalone OCR
 
 ```bash
@@ -103,6 +105,24 @@ Or in one shot with the integrated pipeline:
 ```bash
 pipeline-async --pdf-list papers.txt --ragflow
 ```
+
+## 🧪 Prompt Classification
+
+When running librarian through an AI agent (e.g. Hermes Agent), not all prompts reliably trigger the pipeline tools. Some phrasing triggers ad-hoc workflows (direct API calls, temp files, scattered output). The matrix below shows what works:
+
+| Prompt | Router | Comment |
+|--------|--------|---------|
+| `2311.08990` | **`librarian`** | Bare arXiv ID → pipeline |
+| `10.1007/s42484-025-00254-8` | **`librarian`** | Bare DOI → pipeline |
+| `Parse paper.pdf` | **`mineru-api parse`** | Explicit local file |
+| `Download and OCR 2311.08990` | **`librarian`** | Action verb + ID |
+| `Extract text from arXiv:2311.08990` | **`librarian`** | Verb "extract" + arXiv ID |
+| `Read this paper for me: 2311.08990` | **`librarian`** | Vague verb + bare ID still works |
+| `Get me the full text of arXiv paper 2311.08990` | **`librarian`** | Vague verb + "arXiv paper" |
+| `search quantum ml in Zotero and upload` | **`zotero-search`** | Keyword → Zotero search pipeline |
+| `help me access content of arxiv.org/abs/...` | ⚠️ Improvised | Full URL + vague verb bypasses pipeline |
+
+**Rule of thumb:** Bare identifiers (`2311.08990`, `10.1007/...`, `paper.pdf`) and explicit actions (`parse`, `download`, `OCR`) reliably trigger the pipeline. Full arXiv URLs + vague verbs like "access the content" may cause agents to scrape PDFs directly via `web_extract` instead of using the pipeline.
 
 ### Full Researcher Survey
 

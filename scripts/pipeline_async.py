@@ -167,19 +167,23 @@ def _load_meta(pdf_path: Path) -> dict:
 
 # ── OCR helpers ──────────────────────────────────────────────────────────
 
-def _ocr_chunked_v4(pdf_path, page_count, token, lang, key):
-    """
-    OCR a large PDF (>200 pages) by splitting into 200-page chunks via v4 API.
+def _ocr_chunked(pdf_path, page_count, token, lang, key, api_version="v1"):
+    """OCR a large PDF by splitting into chunks.
 
-    Each chunk is saved to <pdf_parent>/_ocr/<key>/full_N.md for resumability.
+    v1: 20-page chunks (≤10MB limit, no token needed)
+    v4: 200-page chunks (≤200MB limit, needs MINERU_TOKEN)
+
+    Each chunk saved to <pdf_parent>/_ocr/<key>/full_N.md for resumability.
     Returns (merged_path, merged_text).
     """
-    chunks = [(i * 200 + 1, min((i + 1) * 200, page_count))
-              for i in range((page_count + 199) // 200)]
-    print(f"  [{key[:40]}] {page_count}p → {len(chunks)} v4 chunks")
+    chunk_size = 20 if api_version == "v1" else 200
+    chunks = [(i * chunk_size + 1, min((i + 1) * chunk_size, page_count))
+              for i in range((page_count + chunk_size - 1) // chunk_size)]
+    print(f"  [{key[:40]}] {page_count}p → {len(chunks)} {api_version} chunks")
     chunk_dir = pdf_path.parent / OCR_OUTPUT_DIR / key
     chunk_dir.mkdir(parents=True, exist_ok=True)
     parts = []
+    import mineru_api as _ma
     for i, (s, e) in enumerate(chunks):
         out_md = chunk_dir / f"full_{i+1}.md"
         if out_md.exists():
@@ -187,33 +191,52 @@ def _ocr_chunked_v4(pdf_path, page_count, token, lang, key):
             parts.append(text)
             print(f"    chunk {i+1}/{len(chunks)} cached ({len(text)} chars)")
             continue
-        data = submit_by_file(str(pdf_path), api_version="v4", language=lang,
-                              page_ranges=f"{s}-{e}", token=token)
-        tid = data["data"]["batch_id"]
-        import mineru_api as _ma
-        start_t = time.time()
-        while time.time() - start_t < 300:
-            d = _ma.query_batch(tid, token=token)
-            results = d["data"].get("extract_result", [])
-            if not results:
-                time.sleep(DEFAULT_POLL_INTERVAL); continue
-            if results[0].get("state") == "done":
-                break
-            if results[0].get("state") == "failed":
-                raise RuntimeError(results[0].get("err_msg", f"chunk {i+1} failed"))
-            time.sleep(DEFAULT_POLL_INTERVAL)
+        data = submit_by_file(str(pdf_path), api_version=api_version,
+                              language=lang, page_ranges=f"{s}-{e}", token=token)
+        if api_version == "v4":
+            tid = data["data"]["batch_id"]
+            start_t = time.time()
+            while time.time() - start_t < 300:
+                d = _ma.query_batch(tid, token=token)
+                results = d["data"].get("extract_result", [])
+                if not results:
+                    time.sleep(DEFAULT_POLL_INTERVAL); continue
+                if results[0].get("state") == "done":
+                    break
+                if results[0].get("state") == "failed":
+                    raise RuntimeError(results[0].get("err_msg", f"chunk {i+1} failed"))
+                time.sleep(DEFAULT_POLL_INTERVAL)
+            else:
+                raise RuntimeError(f"chunk {i+1} timeout")
+            zip_url = results[0]["full_zip_url"]
+            resp = req_lib.get(zip_url, timeout=120)
+            import zipfile, tempfile
+            with tempfile.TemporaryDirectory() as tmp:
+                zpath = Path(tmp) / "c.zip"; zpath.write_bytes(resp.content)
+                with zipfile.ZipFile(zpath, "r") as zf:
+                    zf.extractall(tmp)
+                mds = list(Path(tmp).rglob("*.md"))
+                if not mds:
+                    raise RuntimeError(f"chunk {i+1}: no md in zip")
+                text = mds[0].read_text("utf-8")
         else:
-            raise RuntimeError(f"chunk {i+1} timeout")
-        zip_url = results[0]["full_zip_url"]
-        resp = req_lib.get(zip_url, timeout=120)
-        import zipfile, tempfile
-        tmp = tempfile.mkdtemp()
-        zpath = Path(tmp) / "c.zip"; zpath.write_bytes(resp.content)
-        with zipfile.ZipFile(zpath, "r") as zf: zf.extractall(tmp)
-        mds = list(Path(tmp).rglob("*.md"))
-        if not mds:
-            raise RuntimeError(f"chunk {i+1}: no md in zip")
-        text = mds[0].read_text("utf-8")
+            # v1: simple task polling + markdown URL
+            tid = data["data"]["task_id"]
+            import time as _time
+            start_t = _time.time()
+            while _time.time() - start_t < 300:
+                d = _ma.query_task(tid, api_version="v1")
+                if d.get("data", {}).get("state") == "done":
+                    break
+                if d.get("data", {}).get("state") == "failed":
+                    raise RuntimeError(d["data"].get("err_msg", f"chunk {i+1} failed"))
+                _time.sleep(DEFAULT_POLL_INTERVAL)
+            else:
+                raise RuntimeError(f"chunk {i+1} timeout")
+            md_url = d["data"]["markdown_url"]
+            resp = req_lib.get(md_url, timeout=120)
+            resp.encoding = "utf-8"
+            text = resp.text
         out_md.write_text(text, "utf-8")
         parts.append(text)
         print(f"    chunk {i+1}/{len(chunks)} done ({len(text)} chars)")
@@ -310,47 +333,33 @@ def process_one(pdf_path, dataset_id, state, state_file, client, lang, pages,
         else:
             print(f"  [{key[:40]}] OCR ...")
             try:
-                # Auto-detect page count for free tier limit (v1: max 20 pages)
-                ocr_pages = pages
-                if ocr_pages is None:
-                    try:
-                        from pypdf import PdfReader
-                        reader = PdfReader(str(pdf_path))
-                        page_count = len(reader.pages)
-                        if page_count > 20:
-                            ocr_pages = "1-20"
-                            print(f"  [{key[:40]}] {page_count} pages → limiting to 1-20")
-                    except Exception:
-                        pass
+                # Get page count for chunking decisions
+                page_count = None
+                try:
+                    from pypdf import PdfReader
+                    reader = PdfReader(str(pdf_path))
+                    page_count = len(reader.pages)
+                except Exception:
+                    pass
 
-                # Auto-detect API version: files >10MB need v4 (requires MINERU_TOKEN)
-                api_version = "v1"
-                token = None
+                # Let mineru_api auto-detect v1 vs v4
+                from mineru_api import _auto_detect_api_version, _env_token
+                api_version = _auto_detect_api_version(str(pdf_path))
+                token = _env_token()
                 file_size_mb = pdf_path.stat().st_size / (1024 * 1024)
-                if file_size_mb > 10:
-                    try:
-                        from mineru_api import _env_token
-                        token = _env_token()
-                    except ImportError:
-                        pass
-                    if token:
-                        api_version = "v4"
-                        print(f"  [{key[:40]}] {file_size_mb:.0f}MB → v4 API")
-                    else:
-                        print(f"  [{key[:40]}] {file_size_mb:.0f}MB → v1 (no MINERU_TOKEN), may fail")
+                print(f"  [{key[:40]}] {file_size_mb:.0f}MB, {page_count or '?'}pp → {api_version}")
 
-                # v4 chunked path: PDFs >200 pages
-                if api_version == "v4" and page_count > 200:
-                    md_path, content = _ocr_chunked_v4(pdf_path, page_count, token, lang, key)
+                # Chunked path for large PDFs
+                CHUNK_LIMIT = 20 if api_version == "v1" else 200
+                if page_count and page_count > CHUNK_LIMIT:
+                    md_path, content = _ocr_chunked(pdf_path, page_count, token, lang, key, api_version)
                     content_sha = hashlib.sha256(content.encode()).hexdigest()
                     _update("ocr_done", ocr_file=str(md_path), sha256=content_sha)
                     print(f"  [{key[:40]}] merged → {len(content)} chars")
-                    # Optional: deposit to structured archive
                     _deposit_md(md_path, dataset_name, pdf_sha, content_sha, key, _update)
-                    # Jump to Step 2 (RAGFlow upload)
                 else:
-                    data = submit_by_file(str(pdf_path), api_version=api_version,
-                                          language=lang, page_ranges=ocr_pages, token=token)
+                    data = submit_by_file(str(pdf_path),
+                                          language=lang, token=token)
                     # v1 returns task_id, v4 batch returns batch_id
                     tid = data["data"].get("task_id") or data["data"]["batch_id"]
                     is_batch = "batch_id" in data["data"] and "task_id" not in data["data"]
@@ -392,13 +401,19 @@ def process_one(pdf_path, dataset_id, state, state_file, client, lang, pages,
                             raise RuntimeError(f"No zip URL: {list(results[0].keys())}")
                         resp = req_lib.get(zip_url, timeout=120)
                         import zipfile, tempfile
-                        tmp = tempfile.mkdtemp()
-                        zpath = Path(tmp) / "result.zip"
-                        zpath.write_bytes(resp.content)
-                        with zipfile.ZipFile(zpath, "r"):
-                            zf.extractall(tmp)
-                        mds = list(Path(tmp).rglob("*.md"))
-                        md_path = mds[0] if mds else None
+                        with tempfile.TemporaryDirectory() as tmp:
+                            zpath = Path(tmp) / "result.zip"
+                            zpath.write_bytes(resp.content)
+                            with zipfile.ZipFile(zpath, "r") as zf:
+                                zf.extractall(tmp)
+                            mds = list(Path(tmp).rglob("*.md"))
+                            if mds:
+                                # Copy to stable _ocr/ dir before temp dir is cleaned
+                                md_name = pdf_path.stem + ".md"
+                                md_path = out_dir / md_name
+                                md_path.write_text(mds[0].read_text("utf-8"), "utf-8")
+                            else:
+                                md_path = None
                     else:
                         saved = download_result(task_data, str(out_dir), api_version=api_version)
                         md_path = saved[0] if saved else None

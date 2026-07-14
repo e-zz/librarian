@@ -32,6 +32,44 @@ from pathlib import Path
 from typing import Optional
 
 
+# ── Lazy .env loading (project-local only) ───────────────────────
+
+def _load_dotenv():
+    """Read all vars from project-local .env into os.environ if not already set.
+
+    Only checks the .env file sitting one directory above this script
+    (i.e., the project root). Does NOT search user home directories —
+    those are deployment-specific paths that don't belong in open-source code.
+    """
+    dotenv = Path(__file__).resolve().parent.parent / ".env"
+    if not dotenv.exists():
+        return
+    try:
+        for line in dotenv.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if "=" not in line or line.startswith("#"):
+                continue
+            k, v = line.split("=", 1)
+            k = k.strip().upper()
+            v = v.strip().strip("'\" \
+")
+            if k and v and not os.environ.get(k):
+                os.environ[k] = v
+    except Exception:
+        pass
+
+
+# Load .env at import time
+_load_dotenv()
+import re
+import shutil
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+
 # ── Configuration (overridable via environment variables) ─────────
 
 # Directory where PDFs are stored.

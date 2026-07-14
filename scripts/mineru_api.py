@@ -60,6 +60,14 @@ BASE_URL = "https://mineru.net"
 DEFAULT_POLL_INTERVAL = 3  # seconds
 DEFAULT_TIMEOUT = 600      # seconds (10 min)
 
+# Chunk limits per API version
+V1_MAX_PAGES = 20    # v1 Agent API: ≤20 pages per request
+V4_MAX_PAGES = 200   # v4 Precision API: ≤200 pages per request
+V1_MAX_SIZE_MB = 10  # v1 Agent API: ≤10MB per request
+
+# Hybrid threshold: ≤40pp → split+v1, >40pp → v4
+HYBRID_PAGE_THRESHOLD = 40
+
 # ── Helpers ──────────────────────────────────────────────────────
 
 
@@ -104,6 +112,62 @@ def _headers(token: str | None = None) -> dict:
     return h
 
 
+# ── API version auto-detect ──────────────────────────────────────
+
+
+def _get_page_count(file_path: str) -> int | None:
+    """Return page count for a PDF, or None if can't be determined."""
+    try:
+        from pypdf import PdfReader
+        reader = PdfReader(str(file_path))
+        return len(reader.pages)
+    except Exception:
+        return None
+
+
+def _auto_detect_api_version(
+    file_path: str | None = None,
+    preferred: str | None = None,
+) -> str:
+    """Auto-detect the best MinerU API version.
+
+    Priority:
+      1. *preferred* explicit caller override
+      2. MINERU_API_VERSION environment variable
+      3. File properties:
+         - <=40 pages -> "v1" (split into 20pp chunks, no token needed)
+         - >40 pages -> "v4" (needs MINERU_TOKEN; falls back to v1+warn)
+         - can't determine -> "v1" (safe default)
+    """
+    if preferred is not None:
+        return preferred
+    env_ver = os.environ.get("MINERU_API_VERSION")
+    if env_ver in ("v1", "v4"):
+        return env_ver
+    if file_path:
+        try:
+            p = Path(file_path)
+            if p.is_file():
+                page_count = _get_page_count(file_path)
+                if page_count is not None:
+                    if page_count <= HYBRID_PAGE_THRESHOLD:
+                        return "v1"
+                    token = _env_token()
+                    if token:
+                        return "v4"
+                    print(
+                        f"WARNING: {page_count}pp > {HYBRID_PAGE_THRESHOLD}, "
+                        "v4 needs MINERU_TOKEN. Falling back to v1 "
+                        "(will truncate to 20pp per chunk).",
+                        file=sys.stderr,
+                    )
+                    return "v1"
+                return "v1"
+        except Exception:
+            pass
+    return "v1"
+
+
 def _check_code(resp: dict, task_id: str = "") -> None:
     """Raise SystemExit on API error."""
     if resp.get("code") != 0:
@@ -142,7 +206,7 @@ def submit_by_url(
     url: str,
     token: str | None = None,
     model_version: str = "pipeline",
-    api_version: str = "v4",
+    api_version: str | None = None,  # None = auto-detect
     is_ocr: bool = False,
     enable_formula: bool = True,
     enable_table: bool = True,
@@ -155,6 +219,8 @@ def submit_by_url(
     data_id: str | None = None,
 ) -> dict:
     """Submit a document URL for parsing. Returns JSON response with task_id."""
+    if api_version is None:
+        api_version = _auto_detect_api_version(preferred=os.environ.get("MINERU_API_VERSION"))
     if api_version == "v4":
         endpoint = f"{BASE_URL}/api/v4/extract/task"
         body = {
@@ -198,7 +264,7 @@ def submit_by_url(
 def submit_by_file(
     file_path: str,
     token: str | None = None,
-    api_version: str = "v4",
+    api_version: str | None = None,  # None = auto-detect
     model_version: str = "pipeline",
     is_ocr: bool = False,
     enable_formula: bool = True,
@@ -210,7 +276,8 @@ def submit_by_file(
 ) -> dict:
     """Upload a local file via signed URL. Returns JSON response with batch_id (v4) or task_id (v1)."""
     file_name = Path(file_path).name
-
+    if api_version is None:
+        api_version = _auto_detect_api_version(file_path)
     if api_version == "v4":
         # Step 1: request signed upload URL
         endpoint = f"{BASE_URL}/api/v4/file-urls/batch"
@@ -218,7 +285,12 @@ def submit_by_file(
             "files": [{"name": file_name}],
             "model_version": model_version,
             "is_ocr": is_ocr,
+            "enable_formula": enable_formula,
+            "enable_table": enable_table,
+            "language": language,
         }
+        if no_cache:
+            body["no_cache"] = no_cache
         if data_id:
             body["files"][0]["data_id"] = data_id
         if page_ranges:
