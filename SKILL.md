@@ -68,11 +68,13 @@ All environment variables used across the pipeline. For detailed effect descript
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `MINERU_TOKEN` | **Yes** | — | mineru.net API token (v4 precision mode) |
+| `MINERU_TOKEN` | 🟡 Optional | — | mineru.net API token (needed for v4 precision mode; v1 works without) |
 | `RAGFLOW_URL` | No | `http://localhost:9380` | RAGFlow server URL |
 | `RAGFLOW_API_KEY` | No | — | RAGFlow API key |
 | `MINERU_PDF_LIBRARY` | No | `./pdfs` | PDF storage directory for `deposit.py` |
 | `MINERU_RAW_DIR` | No | `./_raw` | MinerU OCR output directory |
+| `MINERU_OCR_DIR` | No | `<pdf_dir>/_ocr/` | Centralized OCR cache directory |
+| `MINERU_MANIFEST_PATH` | No | `./_manifest.json` | Manifest for zotero-ocr + deposit lookup |
 | `MINERU_DOWNLOAD_DIR` | No | `./downloads` | Downloaded PDF directory |
 | `MINERU_CACHE_DIR` | No | `~/.mineru_cache` | API response cache |
 | `CONTACT_EMAIL` | No | — | Used in CrossRef User-Agent header |
@@ -139,13 +141,14 @@ Internal shared module. Provides a reusable client class for RAGFlow REST API in
 
 ### 3. `mineru_api.py` — MinerU Cloud API CLI (CLI: `mineru-api`)
 
-Parses PDFs to clean Markdown via the mineru.net Cloud API.
+Parses PDFs to clean Markdown via the mineru.net Cloud API. Auto-detects v1 vs v4 based on page count and file size. Token auto-loaded from `.env` or `~/MinerU/.env`.
 
 ```bash
-mineru-api parse paper.pdf
-mineru-api batch ./pdfs/*.pdf          # batch mode
-mineru-api parse paper.pdf --output-dir ./my_markdown
-mineru-api test                         # API connectivity test
+mineru-api parse paper.pdf                    # auto v1 for ≤40pp, no token needed
+mineru-api parse paper.pdf --api v4           # force v4 precision (needs token)
+mineru-api parse paper.pdf --api v4 --model vlm  # vlm: better formula/table/layout
+mineru-api batch ./pdfs/*.pdf                 # batch mode
+mineru-api test                               # API connectivity test
 ```
 
 ### 4. `pdf_downloader.py` — DOI/arXiv → Download with Metadata Enrichment (CLI: `pdf-downloader`)
@@ -161,13 +164,16 @@ pdf-downloader 2311.08990 --out ./downloads    # custom output dir
 
 ### 5. `pipeline_async.py` — Batch OCR → (Optional) Upload Pipeline (CLI: `pipeline-async`)
 
-The main orchestration script. Reads PDFs as positional args, submits them to MinerU OCR in parallel, then optionally uploads results to RAGFlow.
+The main orchestration script. Reads PDFs as positional args, submits them to MinerU OCR in parallel, then optionally uploads results to RAGFlow with SHA256 dedup. Resume-safe via state file.
 
 ```bash
-pipeline-async process pdfs/*.pdf                       # OCR only
-pipeline-async process pdfs/*.pdf --dataset-id <id>     # OCR + RAGFlow
+pipeline-async process pdfs/*.pdf                        # OCR only
+pipeline-async process pdfs/*.pdf --dataset-id <id>      # OCR + RAGFlow
+pipeline-async process pdfs/*.pdf --model vlm            # use vlm model
+pipeline-async process pdfs/*.pdf --dataset-id <id> --force  # re-upload even if exists
 pipeline-async resume                                    # resume interrupted run
 pipeline-async status                                    # check pipeline state
+pipeline-async reap --watch                              # collect parse results
 ```
 
 ### 6. `ragflow_uploader.py` — Upload Markdown Files to RAGFlow (CLI: `ragflow-upload`)
@@ -201,14 +207,17 @@ scihub-download --mode download --doi 10.1234/example
 
 ### 9. `zotero_linked_pipeline.py` — Zotero → Pipeline Bridge (CLI: `zotero-pipeline`)
 
-Reads linked PDFs from a Zotero collection and feeds them through the OCR pipeline. Requires Zotero desktop + cookjohn MCP plugin.
+Reads all PDF attachments (linked + stored) from a Zotero collection and feeds them through the OCR pipeline. Writes `.meta.json` sidecars for zotero_key tracking. Requires Zotero desktop + cookjohn MCP plugin.
 
 ```bash
 # Dry run — see which PDFs will be processed
-zotero-pipeline --collection "quantum-chemistry" --dry-run
+zotero-pipeline --collection "ADAPT-VQE" --dry-run
 
 # Full pipeline: Zotero PDFs → MinerU OCR → RAGFlow upload
-zotero-pipeline --collection "quantum-chemistry" --dataset-id <id>
+zotero-pipeline --collection "ADAPT-VQE" --dataset-id <id>
+
+# With vlm model + force re-upload
+zotero-pipeline --collection "ADAPT-VQE" --dataset-id <id> --model vlm --force
 ```
 
 Alternatively, `pdf-downloader --zotero` can download a single paper and auto-create its Zotero entry in one step.
@@ -351,3 +360,5 @@ Orchestration:
 - **Sci-Hub availability**: Sci-Hub domains change frequently. The script includes fallback mechanisms, but availability is not guaranteed.
 - **File path length on Windows**: Deeply nested paths from MinerU output may exceed Windows MAX_PATH (260 chars). Use short base directory names.
 - **Concurrent API calls**: MinerU API has per-account concurrency limits. `pipeline_async.py` respects these but you may need to adjust `--max-workers`.
+- **OCR output scattering**: If `MINERU_RAW_DIR` or `MINERU_OCR_DIR` isn't loaded from `.env`, pipeline output lands in CWD. Ensure `.env` is present and loaded before running.
+- **Windows line endings**: MinerU markdown written with `\r\n` on Windows, but Python's `str.encode()` produces `\n`. SHA256 hashes computed via `.encode()` won't match those from `read_bytes()`. `pipeline_async.py` now uses `read_bytes()` consistently — this is fixed in the pipeline but may still affect standalone hash comparisons.
