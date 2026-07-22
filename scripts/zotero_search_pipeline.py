@@ -72,8 +72,8 @@ def search_items(query: str, limit: int = 50) -> list[dict]:
 def resolve_pdf_path(item_key: str) -> Path | None:
     """Return the filesystem path of the first PDF attachment, or None.
 
-    get_item_details returns the full Win32 path in attachments[].path,
-    e.g. C:\\Users\\zhang\\Zotero\\storage\\XXXXXX\\file.pdf.
+    get_item_details returns the full Win32 path in attachments[].path
+    (e.g. <Zotero data directory>/storage/XXXXXX/file.pdf).
     """
     try:
         detail = _mcp_call("get_item_details", {"itemKey": item_key, "mode": "standard"})
@@ -176,6 +176,13 @@ def main():
         print(f"  pipeline_async process <{len(pdfs)} PDFs> --dataset-id {args.ragflow_dataset}")
         print(f"{'='*60}")
         return
+
+    # Write .meta.json sidecar for each PDF so pipeline_async records zotero_key
+    for pdf in pdfs:
+        meta_path = pdf["path"].with_suffix('.meta.json')
+        meta_path.write_text(
+            json.dumps({"zotero_key": pdf["item_key"]}), encoding='utf-8'
+        )
 
     print(f"\n{'='*60}")
     print(f"Phase 3: OCR → RAGFlow ({len(pdfs)} PDFs)")

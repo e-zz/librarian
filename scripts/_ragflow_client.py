@@ -333,13 +333,16 @@ class RAGFlowClient:
             json={"ids": document_ids},
         )
 
-    def get_existing_docs(self, dataset_id: str) -> dict[str, str | None]:
-        """Return {name: sha256_or_none} for all docs in dataset."""
+    def get_existing_docs(self, dataset_id: str) -> dict[str, dict]:
+        """Return {name: {sha256, pdf_sha}} for all docs in dataset."""
         try:
             resp = self.list_documents(dataset_id, page_size=100)
             docs = resp.get("data", {}).get("docs", [])
             return {
-                d["name"]: d.get("meta_fields", {}).get("sha256")
+                d["name"]: {
+                    "sha256": d.get("meta_fields", {}).get("sha256"),
+                    "pdf_sha": d.get("meta_fields", {}).get("pdf_sha"),
+                }
                 for d in docs
             }
         except Exception:

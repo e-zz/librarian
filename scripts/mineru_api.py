@@ -68,6 +68,28 @@ V1_MAX_SIZE_MB = 10  # v1 Agent API: ≤10MB per request
 # Hybrid threshold: ≤40pp → split+v1, >40pp → v4
 HYBRID_PAGE_THRESHOLD = 40
 
+# ── Load .env (stdlib, no external deps) ──────────────────────────────────
+
+def _load_dotenv(*paths):
+    """Load KEY=VALUE pairs from .env files into os.environ."""
+    for p in paths:
+        try:
+            for line in Path(p).read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key, val = key.strip(), val.strip().strip("'\"")
+                if key and key not in os.environ:
+                    os.environ[key] = val
+        except (FileNotFoundError, PermissionError):
+            pass
+
+_load_dotenv(
+    Path(__file__).resolve().parent.parent / ".env",  # mineru_pipeline/.env
+    Path.home() / "Mineru" / ".env",                   # ~/Mineru/.env
+)
+
 # ── Helpers ──────────────────────────────────────────────────────
 
 

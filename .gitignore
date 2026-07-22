@@ -16,3 +16,9 @@ dist/
 _raw/
 .hermes/
 _manifest.json
+# Orphan MinerU output (mineru-api parse defaults --output to CWD)
+[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-*-*-*-*.md
+[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-*.md
+*.md.tmp
+# Personal docs / audits
+personal-info-audit.md

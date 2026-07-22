@@ -393,6 +393,14 @@ def main():
 
     print(f"\n  Created {len(zotero_keys)} Zotero items in collection {args.collection}")
 
+    # Write .meta.json sidecar for each PDF so pipeline_async records zotero_key
+    for aid, item_key in zotero_keys.items():
+        pdf_path = pdfs[aid]
+        meta_path = pdf_path.with_suffix('.meta.json')
+        meta_path.write_text(
+            json.dumps({"zotero_key": item_key}), encoding='utf-8'
+        )
+
     # ── Step 3: OCR + RAGFlow ──────────────────────────────────────────
     if args.dataset_id:
         print(f"\n{'='*60}")

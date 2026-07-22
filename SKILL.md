@@ -213,6 +213,26 @@ zotero-pipeline --collection "quantum-chemistry" --dataset-id <id>
 
 Alternatively, `pdf-downloader --zotero` can download a single paper and auto-create its Zotero entry in one step.
 
+### 9c. `zotero_ocr.py` — Find OCR Markdown for Zotero Items (CLI: `zotero-ocr`)
+
+Given a Zotero item key, finds the MinerU OCR'd full markdown. Two-level lookup: fast via `zotero_key` in `_manifest.json`, fallback via PDF SHA256.
+
+```bash
+# Single item — show path and size
+zotero-ocr A5CFQQQ7
+
+# Batch
+zotero-ocr A5CFQQQ7 AI6UCCVR
+
+# From stdin
+cat keys.txt | zotero-ocr --pipe
+
+# Print full markdown content
+zotero-ocr A5CFQQQ7 --cat
+```
+
+Requires: `_manifest.json` (created by `deposit` / `pipeline-async` during OCR) and the local Zotero PDF files for SHA256 fallback.
+
 ### 10. `librarian_pipeline.py` — One-Shot End-to-End Pipeline (CLI: `librarian`)
 
 Accepts arXiv IDs, DOIs, or local PDFs and runs the full download → OCR workflow. Best starting point for new users.

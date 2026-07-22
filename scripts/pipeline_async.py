@@ -60,6 +60,29 @@ from _ragflow_client import RAGFlowClient
 import mineru_api
 from mineru_api import submit_by_file, poll_and_wait, download_result, BASE_URL
 
+# ── Load .env (stdlib, no external deps) ──────────────────────────────────
+
+def _load_dotenv(*paths):
+    """Load KEY=VALUE pairs from .env files into os.environ (simple parser)."""
+    for p in paths:
+        try:
+            for line in Path(p).read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key, val = key.strip(), val.strip().strip("'\"")
+                if key and key not in os.environ:  # don't override existing
+                    os.environ[key] = val
+        except (FileNotFoundError, PermissionError):
+            pass
+
+# Load from project .env and user home fallback
+_load_dotenv(
+    Path(__file__).resolve().parent.parent / ".env",  # mineru_pipeline/.env
+    Path.home() / "Mineru" / ".env",                   # ~/Mineru/.env
+)
+
 # ── Configurable defaults ────────────────────────────────────────────────
 # These can be overridden via CLI arguments or environment variables.
 
@@ -89,9 +112,21 @@ PDF_SEARCH_DIRS = (
     else [Path(d) for d in _DEFAULT_SEARCH_DIRS]
 )
 
-# OCR output directory (relative to each PDF's parent directory).
-# Chunked v4 results go into <pdf_dir>/_ocr/<file_key>/full_N.md
-OCR_OUTPUT_DIR = "_ocr"
+# OCR output directory.
+# Set MINERU_OCR_DIR in .env to use a centralized dir (e.g. ~/MinerU/_raw/qc).
+# When unset, OCR output goes next to each PDF in _ocr/ subdirectory.
+_OCR_DIR_ENV = os.environ.get("MINERU_OCR_DIR", "")
+OCR_OUTPUT_DIR = Path(_OCR_DIR_ENV) if _OCR_DIR_ENV else Path("_ocr")
+
+
+def _ocr_dir(pdf_path: Path, pdf_key: str = "") -> Path:
+    """Resolve OCR output directory for a PDF.
+
+    When MINERU_OCR_DIR is set, all OCR output goes to that centralized
+    location. Otherwise output goes next to the PDF in _ocr/ subdirectory.
+    """
+    base = OCR_OUTPUT_DIR if OCR_OUTPUT_DIR.is_absolute() else pdf_path.parent / OCR_OUTPUT_DIR
+    return base / pdf_key if pdf_key else base
 
 
 # ── Lock (cross-platform with Windows ctypes support) ────────────────────
@@ -167,7 +202,7 @@ def _load_meta(pdf_path: Path) -> dict:
 
 # ── OCR helpers ──────────────────────────────────────────────────────────
 
-def _ocr_chunked(pdf_path, page_count, token, lang, key, api_version="v1"):
+def _ocr_chunked(pdf_path, page_count, token, lang, key, api_version="v1", model=None):
     """OCR a large PDF by splitting into chunks.
 
     v1: 20-page chunks (≤10MB limit, no token needed)
@@ -180,7 +215,7 @@ def _ocr_chunked(pdf_path, page_count, token, lang, key, api_version="v1"):
     chunks = [(i * chunk_size + 1, min((i + 1) * chunk_size, page_count))
               for i in range((page_count + chunk_size - 1) // chunk_size)]
     print(f"  [{key[:40]}] {page_count}p → {len(chunks)} {api_version} chunks")
-    chunk_dir = pdf_path.parent / OCR_OUTPUT_DIR / key
+    chunk_dir = _ocr_dir(pdf_path, key)
     chunk_dir.mkdir(parents=True, exist_ok=True)
     parts = []
     import mineru_api as _ma
@@ -192,7 +227,8 @@ def _ocr_chunked(pdf_path, page_count, token, lang, key, api_version="v1"):
             print(f"    chunk {i+1}/{len(chunks)} cached ({len(text)} chars)")
             continue
         data = submit_by_file(str(pdf_path), api_version=api_version,
-                              language=lang, page_ranges=f"{s}-{e}", token=token)
+                              language=lang, page_ranges=f"{s}-{e}", token=token,
+                              model_version=model)
         if api_version == "v4":
             tid = data["data"]["batch_id"]
             start_t = time.time()
@@ -219,6 +255,14 @@ def _ocr_chunked(pdf_path, page_count, token, lang, key, api_version="v1"):
                 if not mds:
                     raise RuntimeError(f"chunk {i+1}: no md in zip")
                 text = mds[0].read_text("utf-8")
+                # Preserve images from this chunk
+                chunk_images = Path(tmp) / "images"
+                if chunk_images.is_dir():
+                    import shutil
+                    target = chunk_dir / "images"
+                    target.mkdir(exist_ok=True)
+                    for img in chunk_images.iterdir():
+                        shutil.copy2(str(img), str(target / img.name))
         else:
             # v1: simple task polling + markdown URL
             tid = data["data"]["task_id"]
@@ -246,7 +290,8 @@ def _ocr_chunked(pdf_path, page_count, token, lang, key, api_version="v1"):
     return merged_path, merged
 
 
-def _deposit_md(md_path, dataset_name, pdf_sha, content_sha, key, _update_fn):
+def _deposit_md(md_path, dataset_name, pdf_sha, content_sha, key, _update_fn,
+                zotero_key=""):
     """
     Optionally deposit OCR output to a structured archive.
 
@@ -258,9 +303,12 @@ def _deposit_md(md_path, dataset_name, pdf_sha, content_sha, key, _update_fn):
         return md_path
     try:
         from deposit import deposit_md
+        metadata = {"pdf_sha256": pdf_sha} if pdf_sha else {}
+        if zotero_key:
+            metadata["zotero_key"] = zotero_key
         dep_result = deposit_md(
             Path(md_path), dataset=dataset_name,
-            metadata={"pdf_sha256": pdf_sha} if pdf_sha else None)
+            metadata=metadata or None)
         if dep_result.error == "":
             _update_fn("ocr_done",
                        ocr_file=str(dep_result.canonical_path),
@@ -275,7 +323,8 @@ def _deposit_md(md_path, dataset_name, pdf_sha, content_sha, key, _update_fn):
 # ── Per-file processing ──────────────────────────────────────────────────
 
 def process_one(pdf_path, dataset_id, state, state_file, client, lang, pages,
-                dataset_name: str = "", fire_and_forget: bool = True) -> dict:
+                dataset_name: str = "", fire_and_forget: bool = True,
+                model: str = None, force: bool = False) -> dict:
     """
     OCR → upload → parse for a single PDF. Independent per-file processing.
 
@@ -297,6 +346,7 @@ def process_one(pdf_path, dataset_id, state, state_file, client, lang, pages,
     result = {"file": key}
     # Load paper metadata (e.g., title, authors, DOI) from sidecar file
     paper_meta = _load_meta(pdf_path)
+    zotero_key = paper_meta.get("zotero_key", "") if paper_meta else ""
 
     has_ragflow = bool(dataset_id) and client is not None
 
@@ -352,14 +402,16 @@ def process_one(pdf_path, dataset_id, state, state_file, client, lang, pages,
                 # Chunked path for large PDFs
                 CHUNK_LIMIT = 20 if api_version == "v1" else 200
                 if page_count and page_count > CHUNK_LIMIT:
-                    md_path, content = _ocr_chunked(pdf_path, page_count, token, lang, key, api_version)
+                    md_path, content = _ocr_chunked(pdf_path, page_count, token, lang, key, api_version, model=model)
                     content_sha = hashlib.sha256(content.encode()).hexdigest()
                     _update("ocr_done", ocr_file=str(md_path), sha256=content_sha)
                     print(f"  [{key[:40]}] merged → {len(content)} chars")
-                    _deposit_md(md_path, dataset_name, pdf_sha, content_sha, key, _update)
+                    _deposit_md(md_path, dataset_name, pdf_sha, content_sha, key, _update,
+                                zotero_key=zotero_key)
                 else:
                     data = submit_by_file(str(pdf_path),
-                                          language=lang, token=token)
+                                          language=lang, token=token,
+                                          model_version=model)
                     # v1 returns task_id, v4 batch returns batch_id
                     tid = data["data"].get("task_id") or data["data"]["batch_id"]
                     is_batch = "batch_id" in data["data"] and "task_id" not in data["data"]
@@ -389,7 +441,7 @@ def process_one(pdf_path, dataset_id, state, state_file, client, lang, pages,
                         raise RuntimeError("OCR timeout")
 
                     # Download OCR result
-                    out_dir = pdf_path.parent / OCR_OUTPUT_DIR
+                    out_dir = _ocr_dir(pdf_path)
                     out_dir.mkdir(exist_ok=True)
                     if is_batch:
                         # v4 batch: download zip, extract markdown
@@ -412,6 +464,14 @@ def process_one(pdf_path, dataset_id, state, state_file, client, lang, pages,
                                 md_name = pdf_path.stem + ".md"
                                 md_path = out_dir / md_name
                                 md_path.write_text(mds[0].read_text("utf-8"), "utf-8")
+                                # Also preserve images/ directory if present (vlm model)
+                                images_dir = Path(tmp) / "images"
+                                if images_dir.is_dir():
+                                    import shutil
+                                    target_images = out_dir / "images"
+                                    if target_images.exists():
+                                        shutil.rmtree(target_images)
+                                    shutil.copytree(str(images_dir), str(target_images))
                             else:
                                 md_path = None
                     else:
@@ -423,7 +483,8 @@ def process_one(pdf_path, dataset_id, state, state_file, client, lang, pages,
                     content_sha = hashlib.sha256(content.encode()).hexdigest()
                     _update("ocr_done", ocr_file=str(md_path), sha256=content_sha)
                     print(f"  [{key[:40]}] OCR done ({len(content)} chars)")
-                    _deposit_md(md_path, dataset_name, pdf_sha, content_sha, key, _update)
+                    _deposit_md(md_path, dataset_name, pdf_sha, content_sha, key, _update,
+                                zotero_key=zotero_key)
             except Exception as e:
                 _update("failed", error=f"OCR: {e}")
                 print(f"  [{key[:40]}] OCR FAIL: {e}")
@@ -432,28 +493,50 @@ def process_one(pdf_path, dataset_id, state, state_file, client, lang, pages,
     # ── Step 2: Upload to RAGFlow (skipped if no dataset_id) ──
     if has_ragflow and info["status"] in ("ocr_done",):
         md_path = Path(info.get("ocr_file", ""))
-        content_sha = info.get("sha256", "")
-        # Re-verify file integrity
+        stored_sha = info.get("sha256", "")
+        # Re-verify file integrity: recompute SHA from file bytes
         if not md_path.exists():
             _update("failed", error="OCR file missing")
             print(f"  [{key[:40]}] FAIL: file missing"); return result
-        if hashlib.sha256(md_path.read_bytes()).hexdigest() != content_sha:
-            _update("failed", error="Hash mismatch")
-            print(f"  [{key[:40]}] FAIL: hash mismatch"); return result
-        # Dedup check (name + content SHA256)
+        content_sha = hashlib.sha256(md_path.read_bytes()).hexdigest()
+        if stored_sha and content_sha != stored_sha:
+            print(f"  [{key[:40]}] sha256 updated (file modified since OCR)")
+        _update("ocr_done", sha256=content_sha)
+        # Dedup check: by PDF SHA256 (source identity) + name.
+        # PDF SHA is more reliable than content SHA — OCR minor variations
+        # between runs don't change source identity.
+        # PITFALL: using content_sha for dedup creates duplicates on re-OCR
+        # because markdown content varies slightly across OCR runs.
+        if not pdf_sha:
+            try:
+                from deposit import _sha256_file
+                pdf_sha = _sha256_file(pdf_path)
+            except ImportError:
+                pdf_sha = hashlib.sha256(pdf_path.read_bytes()).hexdigest()
         existing = client.get_existing_docs(dataset_id)
-        if ragflow_name in existing and existing[ragflow_name] == content_sha:
-            _update("done")
-            print(f"  [{key[:40]}] already in RAGFlow"); return result
-        # Cross-name dedup: same content under different name
-        if content_sha in existing.values():
-            _update("done")
-            print(f"  [{key[:40]}] already in RAGFlow (SHA256 match)"); return result
+        if ragflow_name in existing and existing[ragflow_name].get("pdf_sha") == pdf_sha:
+            if force:
+                _update("ocr_done")  # allow re-upload
+                print(f"  [{key[:40]}] force-updating (pdf_sha match, --force)")
+            else:
+                _update("done")
+                print(f"  [{key[:40]}] already in RAGFlow (pdf_sha match)"); return result
+        # Cross-name dedup: same PDF under different name
+        matched_name = None
+        for ename, emeta in existing.items():
+            if isinstance(emeta, dict) and emeta.get("pdf_sha") == pdf_sha:
+                matched_name = ename; break
+        if matched_name:
+            if force:
+                print(f"  [{key[:40]}] force-updating (replaces '{matched_name}')")
+            else:
+                _update("done")
+                print(f"  [{key[:40]}] already in RAGFlow as '{matched_name}'"); return result
         print(f"  [{key[:40]}] uploading ...")
         try:
             content = md_path.read_text(encoding="utf-8")
             # Build meta_fields: dedup hash + paper metadata
-            meta_fields = {"sha256": content_sha}
+            meta_fields = {"sha256": content_sha, "pdf_sha": pdf_sha}
             if paper_meta:
                 if paper_meta.get("title"):
                     meta_fields["title"] = paper_meta["title"]
@@ -560,7 +643,8 @@ def cmd_process(args):
     with ThreadPoolExecutor(max_workers=args.concurrency) as ex:
         futures = {ex.submit(process_one, p, args.dataset_id, state,
                              args.state_file, client, args.lang, args.pages,
-                             dataset_name, fire_and_forget): p.name
+                             dataset_name, fire_and_forget,
+                             args.model, args.force): p.name
                    for p in pdfs}
         for fut in as_completed(futures):
             name = futures[fut]
@@ -793,7 +877,7 @@ def cmd_resume(args):
             futures[ex.submit(process_one, pdf_path, dataset_id,
                               state, args.state_file, client,
                               args.lang, args.pages, dataset_name,
-                              fire_and_forget)] = name
+                              fire_and_forget, args.model, args.force)] = name
         for fut in as_completed(futures):
             try:
                 fut.result()
@@ -855,6 +939,10 @@ Environment:
                    help="OCR language (default: %(default)s)")
     p.add_argument("--pages", default=None,
                    help="Page range, e.g. '1-10' (default: auto-detect, limited to 20 for v1)")
+    p.add_argument("--model", default=None,
+                   help="Model version: pipeline (default) or vlm")
+    p.add_argument("--force", action="store_true",
+                   help="Force re-upload even if PDF SHA256 matches existing doc")
     p.add_argument("--fire-and-forget", action="store_true",
                    help="Upload + start parse, return immediately (use 'reap' to collect)")
     p.add_argument("--blocking", action="store_false", dest="fire_and_forget",

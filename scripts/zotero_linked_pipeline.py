@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Zotero Linked-File → MinerU Pipeline Bridge
-=============================================
+Zotero PDF → MinerU Pipeline Bridge
+=====================================
 
-Finds all linked-file PDFs (linkMode=2) in a Zotero collection,
+Finds all PDF attachments (linked or stored) in a Zotero collection,
 verifies they exist on disk, and feeds them into **pipeline_async.py**
 for OCR / RAGFlow ingestion.
 
@@ -35,15 +35,15 @@ for OCR / RAGFlow ingestion.
 - ``--lang`` — Document language (default: ``en``).
 - ``--concurrency`` — Parallel upload count (default: ``4``).
 - ``--dataset-name`` — Subdirectory name under ``_raw/`` (optional).
-- ``--pages`` — Page range e.g. ``"1-20"`` (optional).
-- ``--dry-run`` — List linked PDFs without running the pipeline.
+- ``--pages`` — Page range e.g. ``1-20`` (optional).
+- ``--model`` — MinerU model: pipeline (default) or vlm (better formula/table/layout, preserves images).
+- ``--dry-run`` — List PDFs without running the pipeline.
 
 **Workflow**
 ------------
 1. Resolve the collection key (accepts key or name).
 2. Query Zotero via cookjohn MCP for all items in the collection.
-3. Filter to **linked-file PDFs** only (linkMode=2, not stored-attachment
-   copies).
+3. Filter to **PDF attachments** (both linked linkMode=2 and stored linkMode=1).
 4. Verify each PDF exists on the local filesystem; warn for missing files.
 5. Pass surviving PDF paths to ``pipeline_async.py process …``.
 
@@ -56,6 +56,7 @@ commit to a shared repository.
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -241,7 +242,7 @@ def resolve_collection_key(name_or_key: str) -> str:
     raise ValueError(f"Collection not found: {name_or_key}")
 
 
-def get_linked_pdfs(collection_key: str) -> list[dict[str, Any]]:
+def get_attached_pdfs(collection_key: str) -> list[dict[str, Any]]:
     """Retrieve all linked-file PDFs from a Zotero collection.
 
     A "linked file" in Zotero (``linkMode == 2``) is a reference to a PDF
@@ -283,36 +284,50 @@ def get_linked_pdfs(collection_key: str) -> list[dict[str, Any]]:
     )
     items: list[dict[str, Any]] = _parse_result(result.get("content", result))
 
-    linked: list[dict[str, Any]] = []
+    attached: list[dict[str, Any]] = []
+    seen_items: set[str] = set()
+
+    # Patterns that signal non-main attachments (supplements, errata, etc.)
+    _NON_MAIN = re.compile(r'\b(supp|supplement|appendix|errata|corrigendum|SI_|SM_)',
+                           re.IGNORECASE)
 
     for item in items:
-        # Walk all attachments on this item.
+        best: Optional[dict] = None  # best valid PDF for this item
+
         for att in item.get("attachments", []):
-            # linkMode=2 means "linked file" (stored by path on local FS).
-            is_linked_pdf = (
-                att.get("linkMode") == 2
-                and att.get("contentType") == "application/pdf"
-            )
-            if not is_linked_pdf:
+            if att.get("contentType") != "application/pdf":
                 continue
 
             path: Optional[str] = att.get("path")
+            if not(path and Path(path).exists()):
+                continue
 
-            if path and Path(path).exists():
-                linked.append(
-                    {
-                        "item_key": item["key"],
-                        "title": item.get("title", "Untitled"),
-                        "path": path,
-                        "filename": att.get("filename", ""),
-                    }
-                )
-            elif path:
-                # Warn but don't fail — other PDFs in the collection may
-                # still be valid.
-                print(f"  ⚠ Missing on disk: {path}", file=sys.stderr)
+            fname = att.get("filename", "")
+            is_main = not _NON_MAIN.search(fname)
 
-    return linked
+            if is_main:
+                # Main-text PDF: take immediately, skip the rest
+                best = {
+                    "title": item.get("title", ""),
+                    "item_key": item.get("key", ""),
+                    "path": path,
+                    "filename": fname,
+                }
+                break
+            elif best is None:
+                # Fallback: first valid PDF (might be supp if no main found)
+                best = {
+                    "title": item.get("title", ""),
+                    "item_key": item.get("key", ""),
+                    "path": path,
+                    "filename": fname,
+                }
+
+        if best:
+            attached.append(best)
+            seen_items.add(best["item_key"])
+
+    return attached
 
 
 # ---------------------------------------------------------------------------
@@ -364,9 +379,19 @@ def main() -> None:
         help="Page range, e.g. 1-20",
     )
     p.add_argument(
+        "--model",
+        default=None,
+        help="Model version: pipeline (default) or vlm",
+    )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="Force re-upload even if PDF SHA256 matches existing doc",
+    )
+    p.add_argument(
         "--dry-run",
         action="store_true",
-        help="List linked PDFs without running the pipeline",
+        help="List PDFs without running the pipeline",
     )
     args = p.parse_args()
 
@@ -378,14 +403,14 @@ def main() -> None:
     print(f"  → key={collection_key}")
 
     # ------------------------------------------------------------------
-    # Step 2 — Fetch linked-file PDFs from Zotero
+    # Step 2 — Fetch PDF attachments from Zotero
     # ------------------------------------------------------------------
-    print("Fetching linked PDFs...")
-    pdfs: list[dict[str, Any]] = get_linked_pdfs(collection_key)
-    print(f"  → {len(pdfs)} linked PDF(s) found")
+    print("Fetching PDFs...")
+    pdfs: list[dict[str, Any]] = get_attached_pdfs(collection_key)
+    print(f"  → {len(pdfs)} PDF(s) found")
 
     if not pdfs:
-        print("No linked PDFs to process.")
+        print("No PDFs to process.")
         return
 
     # Print a human-readable summary of each PDF found.
@@ -400,6 +425,13 @@ def main() -> None:
     if args.dry_run:
         print("\nDry run — no pipeline execution.")
         return
+
+    # Write .meta.json sidecar for each PDF so pipeline_async records zotero_key
+    for pdf in pdfs:
+        meta_path = Path(pdf["path"]).with_suffix('.meta.json')
+        meta_path.write_text(
+            json.dumps({"zotero_key": pdf["item_key"]}), encoding='utf-8'
+        )
 
     # ------------------------------------------------------------------
     # Step 4 — Invoke pipeline_async.py
@@ -422,6 +454,10 @@ def main() -> None:
         cmd += ["--dataset-name", args.dataset_name]
     if args.pages:
         cmd += ["--pages", args.pages]
+    if args.model:
+        cmd += ["--model", args.model]
+    if getattr(args, "force", False):
+        cmd += ["--force"]
 
     print(f"\nRunning: {' '.join(cmd)}")
     # Use check=False to let the user see pipeline_async.py's own stderr
