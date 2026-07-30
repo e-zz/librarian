@@ -38,6 +38,18 @@ from pathlib import Path
 # ── MCP endpoint ──────────────────────────────────────────────────────────
 MCP_URL = "http://127.0.0.1:23120/mcp"
 
+# ── Semantic Scholar citation count ────────────────────────────────────────
+def fetch_citation_count(arxiv_id):
+    """Query Semantic Scholar API for citation count by arXiv ID."""
+    import json as _json
+    url = f"https://api.semanticscholar.org/graph/v1/paper/arXiv:{arxiv_id}?fields=citationCount"
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            data = _json.loads(resp.read())
+            return data.get("citationCount", 0)
+    except Exception:
+        return None
+
 # Ensure sibling scripts are importable
 _SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(_SCRIPTS_DIR) not in sys.path:
@@ -128,8 +140,66 @@ def fetch_arxiv_meta(arxiv_id: str) -> dict:
         "authors": authors,
         "year": year,
         "arxiv_url": f"https://arxiv.org/abs/{arxiv_id}",
-        "doi": f"10.48550/arXiv.{arxiv_id}",
+        "arxiv_id": arxiv_id,
+        "doi": "",
+        "journal_ref": "",
+        "journal_abbrev": "",
+        "issue": "",
+        "pages": "",
+        "volume": "",
     }
+
+
+def _journal_abbrev(jref: str) -> str:
+    """Extract journal abbreviation from journal_ref or container title."""
+    ABBREV = {
+        "physical review letters": "Phys. Rev. Lett.", "phys. rev. lett.": "Phys. Rev. Lett.",
+        "nature ": "Nature", "science ": "Science",
+        "nature photonics": "Nat. Photonics", "nature communications": "Nat. Commun.",
+        "applied physics reviews": "Appl. Phys. Rev.", "quantum ": "Quantum",
+    }
+    for full, abbr in sorted(ABBREV.items(), key=lambda x: -len(x[0])):
+        if full in jref.lower():
+            return abbr
+    return ""
+
+
+def enrich_crossref(meta: dict) -> None:
+    """Enrich metadata with CrossRef: DOI, issue, pages, journal abbrev."""
+    arxiv_url = f"https://export.arxiv.org/api/query?id_list={meta['arxiv_id']}"
+    req = urllib.request.Request(arxiv_url, headers={"User-Agent": "collect-papers/1.0"})
+    try:
+        resp = urllib.request.urlopen(req, timeout=30).read().decode()
+        root = ET.fromstring(resp)
+        ns = {"a": "http://www.w3.org/2005/Atom", "x": "http://arxiv.org/schemas/atom"}
+        entry = root.find("a:entry", ns)
+        if entry is not None:
+            jref_el = entry.find("x:journal_ref", ns)
+            if jref_el is not None and jref_el.text:
+                meta["journal_ref"] = jref_el.text.strip()
+                meta["journal_abbrev"] = _journal_abbrev(meta["journal_ref"])
+            doi_el = entry.find("x:doi", ns)
+            if doi_el is not None and doi_el.text:
+                meta["doi"] = doi_el.text.strip()
+    except Exception:
+        pass
+    doi = meta.get("doi", "")
+    if not doi or "arXiv" in doi:
+        return
+    url = f"https://api.crossref.org/works/{doi}"
+    req = urllib.request.Request(url, headers={"User-Agent": "collect-papers/1.0"})
+    time.sleep(0.5)
+    try:
+        resp = urllib.request.urlopen(req, timeout=15).read().decode()
+        data = json.loads(resp).get("message", {})
+        meta["issue"] = data.get("issue", "") or data.get("journal-issue", {}).get("issue", "")
+        meta["pages"] = data.get("page", "")
+        meta["volume"] = data.get("volume", "")
+        pub = (data.get("container-title") or [""])[0]
+        if pub and not meta.get("journal_abbrev"):
+            meta["journal_abbrev"] = _journal_abbrev(pub)
+    except Exception:
+        pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -218,21 +288,30 @@ def create_zotero_entry(arxiv_id: str, pdf_path: Path, collection_key: str,
     """
     if meta is None:
         meta = fetch_arxiv_meta(arxiv_id)
+    enrich_crossref(meta)  # get DOI, issue, pages, journal from CrossRef
 
     # 2a. Create bibliographic entry
+    fields = {
+        "title": meta["title"],
+        "DOI": meta.get("doi", ""),
+        "url": meta.get("arxiv_url", ""),
+        "abstractNote": meta.get("summary", ""),
+        "date": meta.get("year", ""),
+        "publicationTitle": meta.get("journal_ref", "").split(",")[0] if meta.get("journal_ref") else "arXiv preprint",
+        "volume": str(meta.get("volume", "")),
+        "issue": str(meta.get("issue", "")),
+        "pages": str(meta.get("pages", "")),
+        "journalAbbreviation": meta.get("journal_abbrev", ""),
+        "language": "en",
+        "shortTitle": meta["title"].split(".")[0].strip()[:80],
+    }
+    fields = {k: v for k, v in fields.items() if v and v != "None" and v != ""}
     result_json = mcp_raw("write_item", {
         "action": "create",
         "itemType": "journalArticle",
-        "fields": {
-            "title": meta["title"],
-            "DOI": meta["doi"],
-            "url": meta["arxiv_url"],
-            "abstractNote": meta["summary"],
-            "date": meta["year"],
-            "publicationTitle": "arXiv preprint",
-        },
+        "fields": fields,
         "creators": meta["authors"],
-        "tags": ["hermes-20260714", "SQD", "from-collect"],
+        "tags": ["from-collect"],
     })
 
     # Extract item key from response
@@ -254,6 +333,14 @@ def create_zotero_entry(arxiv_id: str, pdf_path: Path, collection_key: str,
         "itemKey": item_key,
         "fields": {"title": meta["title"]},
     })
+
+    # Fetch and store citation count in Zotero extra field
+    cite_count = fetch_citation_count(arxiv_id)
+    if cite_count is not None:
+        mcp_call("write_metadata", {
+            "itemKey": item_key,
+            "fields": {"extra": f"citationCount: {cite_count}"},
+        })
 
     # 2b. Attach PDF
     pdf_win = str(pdf_path)  # Win32 native path from resolved Path
@@ -337,6 +424,8 @@ def main():
     p.add_argument("--download-dir", help="Download directory (default: downloads/<dataset-name>/)")
     p.add_argument("--lang", default="en", help="Document language")
     p.add_argument("--concurrency", type=int, default=4, help="Download/OCR concurrency")
+    p.add_argument("--delay", type=float, default=0,
+                   help="Seconds delay between papers at Zotero step (e.g. 1.0 to avoid MCP rate limiting)")
     p.add_argument("--dry-run", action="store_true", help="Show what would happen")
     p.add_argument("--no-cover", action="store_true",
                    help="Skip zotero coverage check (checking each ID against library is slow in batch)")
@@ -384,6 +473,8 @@ def main():
             zotero_keys[aid] = item_key
             sz = pdfs[aid].stat().st_size / (1024 * 1024)
             print(f"  ✓ [{aid}] → [{item_key}] ({sz:.1f} MB)")
+            if args.delay > 0:
+                time.sleep(args.delay)
         except Exception as e:
             print(f"  ✗ [{aid}] Zotero error: {e}")
 
