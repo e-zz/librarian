@@ -171,14 +171,20 @@ def _auto_detect_api_version(
             p = Path(file_path)
             if p.is_file():
                 page_count = _get_page_count(file_path)
+                size_mb = _file_size_mb(file_path)
                 if page_count is not None:
-                    if page_count <= HYBRID_PAGE_THRESHOLD:
+                    # v1 Agent API: ≤10MB AND ≤40 pages (chunked to 20pp).
+                    # Size gate is mandatory — chunking by page_range does NOT
+                    # reduce upload size; a 32MB/30pp file still exceeds the
+                    # 10MB request limit if routed to v1.
+                    if size_mb <= V1_MAX_SIZE_MB and page_count <= HYBRID_PAGE_THRESHOLD:
                         return "v1"
                     token = _env_token()
                     if token:
                         return "v4"
                     print(
-                        f"WARNING: {page_count}pp > {HYBRID_PAGE_THRESHOLD}, "
+                        f"WARNING: {size_mb:.0f}MB / {page_count}pp exceeds v1 limits "
+                        f"({V1_MAX_SIZE_MB}MB / {HYBRID_PAGE_THRESHOLD}pp), "
                         "v4 needs MINERU_TOKEN. Falling back to v1 "
                         "(will truncate to 20pp per chunk).",
                         file=sys.stderr,

@@ -13,6 +13,8 @@ Usage:
 """
 
 import json
+import os
+import re
 import urllib.error
 import urllib.request
 from typing import Any
@@ -151,6 +153,80 @@ def resolve_pdf_path(item_key: str) -> str | None:
                         return path_str
     except Exception:
         pass
+    return None
+
+
+# ── Local-API-only PDF path resolution (no MCP) ───────────────────────────
+
+
+def _zotero_dirs() -> tuple[str | None, str | None]:
+    """(linked-base-attachment-dir, data-dir) parsed from Zotero prefs.js.
+
+    The local API returns RELATIVE attachment paths ('attachments:qn/...' or
+    'storage:NAME'); the absolute path needs Zotero's own config:
+    extensions.zotero.baseAttachmentPath (linked base) and dataDir (storage).
+    Cached after first parse.
+    """
+    global _ZOTERO_DIRS_CACHE
+    if _ZOTERO_DIRS_CACHE is not None:
+        return _ZOTERO_DIRS_CACHE
+    base = data = None
+    import glob
+    from pathlib import Path as _P
+    pattern = os.path.join(os.environ.get("APPDATA", ""), "Zotero", "Zotero",
+                           "Profiles", "*", "prefs.js")
+    for prefs in glob.glob(pattern):
+        try:
+            txt = _P(prefs).read_text(encoding="utf-8")
+        except OSError:
+            continue
+        m = re.search(r'user_pref\("extensions\.zotero\.baseAttachmentPath",\s*"([^"]*)"\)', txt)
+        if m:
+            base = m.group(1).replace("\\\\", "\\")
+        m = re.search(r'user_pref\("extensions\.zotero\.dataDir",\s*"([^"]*)"\)', txt)
+        if m:
+            data = m.group(1).replace("\\\\", "\\")
+        if base and data:
+            break
+    _ZOTERO_DIRS_CACHE = (base, data)
+    return _ZOTERO_DIRS_CACHE
+
+
+_ZOTERO_DIRS_CACHE: tuple[str | None, str | None] | None = None
+
+
+def resolve_pdf_path_local(item_key: str) -> str | None:
+    """First PDF attachment path via the LOCAL API ONLY (no MCP).
+
+    children endpoint (:23119) -> data.path ('attachments:REL' / 'storage:NAME')
+    -> absolute path from prefs.js base dirs. Falls back to None on any
+    failure; callers may then fall back to the MCP channel.
+    """
+    from pathlib import Path
+    try:
+        kids = local_api(f"/items/{item_key}/children")
+        if not isinstance(kids, list):
+            return None
+        base, data = _zotero_dirs()
+        for kid in kids:
+            d = kid.get("data", kid)
+            if d.get("contentType") != "application/pdf":
+                continue
+            rel = d.get("path", "").replace("/", os.sep)
+            if rel.startswith("attachments:"):
+                if not base:
+                    return None
+                abs_path = os.path.join(base, rel[len("attachments:"):])
+            elif rel.startswith("storage:"):
+                if not data:
+                    return None
+                abs_path = os.path.join(data, "storage", rel[len("storage:"):])
+            else:
+                abs_path = rel
+            if Path(abs_path).exists():
+                return abs_path
+    except Exception:
+        return None
     return None
 
 

@@ -81,6 +81,7 @@ Output goes to `./_raw/<paper_name>/` as clean Markdown.
 | `scihub-download` | `scihub_downloader.py` | Extract/download PDFs from Sci-Hub/PMC |
 | `deposit` | `deposit.py` | Place files into managed library with manifest |
 | `zotero-pipeline` | `zotero_linked_pipeline.py` | Bridge Zotero collection → pipeline |
+| `collect` | `collect_papers.py` | **One-shot import** — arXiv ID → Zotero + PDF + OCR + RAGFlow |
 
 ## 🔧 Workflows
 
@@ -123,6 +124,14 @@ When running librarian through an AI agent (e.g. Hermes Agent), not all prompts 
 | `help me access content of arxiv.org/abs/...` | ⚠️ Improvised | Full URL + vague verb bypasses pipeline |
 
 **Rule of thumb:** Bare identifiers (`2311.08990`, `10.1007/...`, `paper.pdf`) and explicit actions (`parse`, `download`, `OCR`) reliably trigger the pipeline. Full arXiv URLs + vague verbs like "access the content" may cause agents to scrape PDFs directly via `web_extract` instead of using the pipeline.
+
+### One-Shot Import (Zotero + PDF + OCR + RAGFlow)
+
+```bash
+collect 1612.01199 2012.01625 --collection XNPAFHMB --dataset-id c045fece...
+```
+
+This single command handles: arXiv metadata fetch → CrossRef enrichment (DOI, issue, pages, journal abbrev) → Zotero entry creation with complete metadata → PDF attachment → OCR → RAGFlow upload.
 
 ### Full Researcher Survey
 

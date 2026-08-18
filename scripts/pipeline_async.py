@@ -98,6 +98,87 @@ DEFAULT_CONCURRENCY = 4
 
 # Polling interval (seconds) between MinerU / RAGFlow API status checks.
 DEFAULT_POLL_INTERVAL = 3
+# OCR chunk polling: a 200-page textbook chunk takes 5-15 min on v4 VLM, and
+# jobs may sit in the server queue ("pending") long before processing starts.
+# Do NOT kill on wall-clock alone — see _poll_ocr_state().
+CHUNK_POLL_TIMEOUT = 1800   # seconds (30 min) — legacy hard cap, kept for compat
+POLL_HARD_CAP = 7200        # seconds (2h) — absolute last-resort safety net
+# States observed from MinerU API (see mineru_api.poll_and_wait):
+#   done → success; failed → terminal error with err_msg;
+#   pending/running/converting/waiting-file/uploading → alive, keep waiting
+_ALIVE_STATES = {"pending", "running", "converting", "waiting-file", "uploading",
+                 "queued", "processing", "extracting", "waiting"}
+# Terminal-bad states: abort immediately with diagnostic, never wait these out
+_DEAD_STATES = {"failed", "canceled", "cancelled", "error", "timeout", "expired",
+                "deleted", "rejected"}
+
+
+def _poll_ocr_state(query_fn, label: str, interval: int = DEFAULT_POLL_INTERVAL,
+                    hard_cap: int = POLL_HARD_CAP) -> dict:
+    """State-aware OCR poll. Aborts ONLY on terminal failure states; waits
+    through queue/processing states. Returns the 'done' data dict.
+
+    query_fn() -> (state, err_msg, data). Prints state transitions so queued
+    vs processing is visible. Unknown states warn but keep polling (the API
+    may add states); only the hard cap can kill a job that never reaches a
+    terminal state.
+    """
+    start = time.time()
+    last = None
+    while True:
+        state, err, data = query_fn()
+        if state != last:
+            print(f"    [{label}] state={state} ({int(time.time()-start)}s)")
+            last = state
+        if state == "done":
+            return data
+        if state in _DEAD_STATES:
+            raise RuntimeError(f"[{label}] {state}: {err or state}")
+        if state not in _ALIVE_STATES:
+            print(f"    [{label}] WARNING unknown state={state!r} — keep polling")
+        if time.time() - start > hard_cap:
+            raise RuntimeError(f"[{label}] hard cap {hard_cap}s reached, last state {state}")
+        time.sleep(interval)
+
+
+def _batch_state(batch_id: str, token: str | None, chunk_no: int = 0,
+                 chunk_total: int = 0):
+    """Query helper for _poll_ocr_state: v4 batch → (state, err_msg, data)."""
+    import mineru_api as _ma
+    d = _ma.query_batch(batch_id, token=token)
+    results = d["data"].get("extract_result", [])
+    if not results:
+        return "waiting", "", d
+    label = f"chunk {chunk_no}/{chunk_total}" if chunk_total else ""
+    st = results[0].get("state", "?")
+    err = results[0].get("err_msg", "")
+    if st == "done" and not results[0].get("full_zip_url"):
+        # done but no download URL yet — treat as still-finalizing
+        return "running", "", d
+    return st, err, d
+
+
+def _task_state(task_id: str, chunk_no: int = 0, chunk_total: int = 0):
+    """Query helper for _poll_ocr_state: v1 task → (state, err_msg, data)."""
+    import mineru_api as _ma
+    d = _ma.query_task(task_id, api_version="v1")
+    st = d.get("data", {}).get("state", "?")
+    err = d.get("data", {}).get("err_msg", "")
+    return st, err, d
+
+
+def _chunk_cache_model(chunk_dir, n: int):
+    """Read the model marker of cached chunk n (pipeline/vlm).
+
+    Returns the recorded model, or None for legacy chunks created before this
+    feature. Legacy chunks are treated as 'pipeline' by callers via the
+    (cache_model or 'legacy') convention — they are re-OCR'd when the requested
+    model is vlm, reused when it's the default pipeline.
+    """
+    mf = chunk_dir / f"full_{n}.model"
+    if mf.exists():
+        return mf.read_text("utf-8").strip().lower()
+    return None
 
 # Directories to search when resuming and a PDF's stored path is missing.
 # Override by setting the PIPELINE_PDF_SEARCH_DIRS env var (semicolon-separated).
@@ -219,31 +300,33 @@ def _ocr_chunked(pdf_path, page_count, token, lang, key, api_version="v1", model
     chunk_dir.mkdir(parents=True, exist_ok=True)
     parts = []
     import mineru_api as _ma
+    req_model = (model or "pipeline").strip().lower()
     for i, (s, e) in enumerate(chunks):
         out_md = chunk_dir / f"full_{i+1}.md"
-        if out_md.exists():
+        cache_model = _chunk_cache_model(chunk_dir, i + 1)
+        # Incremental cache: reuse chunk iff it matches the requested model.
+        # Legacy chunks (pre-marker, cache_model None) were created by the
+        # default pipeline model → reused for pipeline, re-OCR'd for vlm.
+        if out_md.exists() and (cache_model == req_model
+                                or (cache_model is None and req_model == "pipeline")):
             text = out_md.read_text("utf-8")
             parts.append(text)
-            print(f"    chunk {i+1}/{len(chunks)} cached ({len(text)} chars)")
+            print(f"    chunk {i+1}/{len(chunks)} cached ({len(text)} chars, model={cache_model or 'pipeline'})")
             continue
+        if out_md.exists():
+            # stale cache (model mismatch or legacy chunk needing vlm) → re-OCR this chunk only
+            print(f"    chunk {i+1}/{len(chunks)} re-OCR (cached model={cache_model or 'legacy'} != {req_model})")
         data = submit_by_file(str(pdf_path), api_version=api_version,
                               language=lang, page_ranges=f"{s}-{e}", token=token,
                               model_version=model)
         if api_version == "v4":
             tid = data["data"]["batch_id"]
-            start_t = time.time()
-            while time.time() - start_t < 300:
-                d = _ma.query_batch(tid, token=token)
-                results = d["data"].get("extract_result", [])
-                if not results:
-                    time.sleep(DEFAULT_POLL_INTERVAL); continue
-                if results[0].get("state") == "done":
-                    break
-                if results[0].get("state") == "failed":
-                    raise RuntimeError(results[0].get("err_msg", f"chunk {i+1} failed"))
-                time.sleep(DEFAULT_POLL_INTERVAL)
-            else:
-                raise RuntimeError(f"chunk {i+1} timeout")
+            d = _poll_ocr_state(
+                lambda: _batch_state(tid, token, i + 1, len(chunks)),
+                f"chunk {i+1}/{len(chunks)}")
+            results = d["data"].get("extract_result", [])
+            if not results or "full_zip_url" not in results[0]:
+                raise RuntimeError(f"chunk {i+1}: no full_zip_url in done response")
             zip_url = results[0]["full_zip_url"]
             resp = req_lib.get(zip_url, timeout=120)
             import zipfile, tempfile
@@ -266,24 +349,17 @@ def _ocr_chunked(pdf_path, page_count, token, lang, key, api_version="v1", model
         else:
             # v1: simple task polling + markdown URL
             tid = data["data"]["task_id"]
-            import time as _time
-            start_t = _time.time()
-            while _time.time() - start_t < 300:
-                d = _ma.query_task(tid, api_version="v1")
-                if d.get("data", {}).get("state") == "done":
-                    break
-                if d.get("data", {}).get("state") == "failed":
-                    raise RuntimeError(d["data"].get("err_msg", f"chunk {i+1} failed"))
-                _time.sleep(DEFAULT_POLL_INTERVAL)
-            else:
-                raise RuntimeError(f"chunk {i+1} timeout")
+            d = _poll_ocr_state(
+                lambda: _task_state(tid, i + 1, len(chunks)),
+                f"chunk {i+1}/{len(chunks)}")
             md_url = d["data"]["markdown_url"]
             resp = req_lib.get(md_url, timeout=120)
             resp.encoding = "utf-8"
             text = resp.text
         out_md.write_text(text, "utf-8")
+        (chunk_dir / f"full_{i+1}.model").write_text(req_model, "utf-8")
         parts.append(text)
-        print(f"    chunk {i+1}/{len(chunks)} done ({len(text)} chars)")
+        print(f"    chunk {i+1}/{len(chunks)} done ({len(text)} chars, model={req_model})")
     merged = "\n\n".join(parts)
     merged_path = chunk_dir / "full_merged.md"
     merged_path.write_text(merged, "utf-8")
@@ -416,29 +492,18 @@ def process_one(pdf_path, dataset_id, state, state_file, client, lang, pages,
                     tid = data["data"].get("task_id") or data["data"]["batch_id"]
                     is_batch = "batch_id" in data["data"] and "task_id" not in data["data"]
 
-                    # Poll until OCR complete
+                    # Poll until OCR complete (state-aware: only abort on
+                    # terminal failures; queue/processing states keep waiting)
                     import mineru_api as _ma
-                    start = time.time()
-                    while time.time() - start < 300:
-                        if is_batch:
-                            d = _ma.query_batch(tid, token=token)
-                            results = d["data"].get("extract_result", [])
-                            done_flag = results and results[0].get("state") == "done"
-                            failed_flag = results and results[0].get("state") == "failed"
-                        else:
-                            d = _ma.query_task(tid, token=token, api_version=api_version)
-                            done_flag = d.get("data", {}).get("state") == "done"
-                            failed_flag = d.get("data", {}).get("state") == "failed"
-                        if done_flag:
-                            task_data = d
-                            break
-                        elif failed_flag:
-                            err = (results[0].get("err_msg", "failed") if is_batch
-                                   else d.get("data", {}).get("err_msg", "failed"))
-                            raise RuntimeError(err)
-                        time.sleep(DEFAULT_POLL_INTERVAL)
+                    if is_batch:
+                        d = _poll_ocr_state(
+                            lambda: _batch_state(tid, token, 0, 0),
+                            key[:40])
                     else:
-                        raise RuntimeError("OCR timeout")
+                        d = _poll_ocr_state(
+                            lambda: _task_state(tid, 0, 0),
+                            key[:40])
+                    task_data = d
 
                     # Download OCR result
                     out_dir = _ocr_dir(pdf_path)
@@ -959,6 +1024,10 @@ Environment:
                     help="OCR language (default: %(default)s)")
     p2.add_argument("--pages", default=None,
                     help="Page range, e.g. '1-10'")
+    p2.add_argument("--model", default=None,
+                    help="Model version: pipeline (default) or vlm")
+    p2.add_argument("--force", action="store_true",
+                    help="Force re-upload even if PDF SHA256 matches existing doc")
     p2.add_argument("--fire-and-forget", action="store_true",
                     help="Upload + start parse, return immediately (use 'reap' to collect)")
     p2.add_argument("--blocking", action="store_false", dest="fire_and_forget",

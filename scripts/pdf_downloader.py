@@ -296,8 +296,9 @@ def resolve_to_arxiv(raw: str) -> dict | None:
     raw = raw.strip()
 
     # --- arXiv URL pattern ---
-    # Matches: https://arxiv.org/abs/2311.08990, https://arxiv.org/abs/2311.08990v2
-    m = re.search(r'arxiv\.org/abs/([\d.]+(?:v\d+)?)', raw)
+    # Matches: https://arxiv.org/abs/2311.08990, https://arxiv.org/abs/2311.08990v2,
+    #           https://arxiv.org/abs/quant-ph/0508139 (legacy category IDs)
+    m = re.search(r'arxiv\.org/abs/((?:[a-z-]+/)?[\d.]+(?:v\d+)?)', raw)
     if m:
         aid = m.group(1).rstrip('/')
         return {
@@ -309,6 +310,15 @@ def resolve_to_arxiv(raw: str) -> dict | None:
     # --- Bare arXiv ID ---
     # Matches the standard arXiv identifier format: YYMM.NNNNN or YYMM.NNNNNvN
     if re.match(r'^\d{4}\.\d{4,8}(v\d+)?$', raw):
+        return {
+            "arxiv_id": raw,
+            "arxiv_url": f"https://arxiv.org/abs/{raw}",
+            "doi": None,
+        }
+
+    # --- Legacy arXiv ID (e.g. quant-ph/0508139) ---
+    # Pre-2007 format: category prefix + slash + 7-digit number (optional version)
+    if re.match(r'^[a-z-]+/\d{7}(v\d+)?$', raw):
         return {
             "arxiv_id": raw,
             "arxiv_url": f"https://arxiv.org/abs/{raw}",
@@ -364,6 +374,10 @@ def download_arxiv(arxiv_id: str, dest_dir: Path = DOWNLOAD_DIR) -> Path | None:
     """
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / f"{arxiv_id}.pdf"
+
+    # Legacy IDs (e.g. quant-ph/0508139) nest a category subdirectory in the
+    # filename; ensure that parent dir exists before opening the file.
+    dest.parent.mkdir(parents=True, exist_ok=True)
 
     # Skip if already downloaded (non-empty file)
     if dest.exists() and dest.stat().st_size > 1000:

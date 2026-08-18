@@ -568,6 +568,11 @@ def main():
     p = sub.add_parser("manifest-lookup", help="Look up file in manifest")
     p.add_argument("path", help="File path to look up by SHA256")
 
+    # ── SQLite audit / search (read-only index alongside manifest) ──
+    p = sub.add_parser("audit", help="Scan _raw/ and populate papers.db")
+    p = sub.add_parser("search", help="Search papers.db by title/author")
+    p.add_argument("query", help="Search query")
+
     args = ap.parse_args()
 
     if args.cmd == "pdf":
@@ -595,6 +600,73 @@ def main():
             print(json.dumps(entry, indent=2, ensure_ascii=False))
         else:
             print("Not found in manifest")
+
+    elif args.cmd == "audit":
+        import sqlite3
+        db_path = RAW_DIR.parent / "papers.db"
+        db = sqlite3.connect(str(db_path))
+        db.execute("PRAGMA journal_mode=WAL")
+        db.executescript("""
+            CREATE TABLE IF NOT EXISTS papers (
+                sha256 TEXT PRIMARY KEY, title TEXT, first_author TEXT,
+                dataset TEXT, ocr_path TEXT, ocr_date TEXT
+            );
+            CREATE VIRTUAL TABLE IF NOT EXISTS papers_fts
+                USING fts5(title, first_author, content='papers', content_rowid='rowid');
+        """)
+        db.commit()
+
+        count = 0
+        for md_path in sorted(RAW_DIR.rglob("full.md")):
+            sha = _sha256_file(md_path)
+            existing = db.execute("SELECT 1 FROM papers WHERE sha256=?", (sha,)).fetchone()
+            if existing:
+                continue
+            parts = md_path.parts
+            dataset = parts[-3] if len(parts) >= 3 and parts[-3] != "_raw" else ""
+            text = md_path.read_text(encoding="utf-8", errors="ignore")
+            lines = text.split("\n")
+            title = lines[0].replace("# ", "").strip()[:200] if lines else ""
+            # Extract first author from line 3
+            author_line = ""
+            for i in range(2, min(6, len(lines))):
+                line = lines[i].strip()
+                if line and "," in line and not line.startswith("#"):
+                    author_line = line
+                    break
+            first_author = author_line.split(",")[0].split("1")[0].strip().rstrip("*").strip()[:80]
+
+            ocr_path = str(md_path.relative_to(RAW_DIR.parent) if RAW_DIR.parent in md_path.parents else md_path)
+
+            db.execute(
+                "INSERT INTO papers (sha256, title, first_author, dataset, ocr_path, ocr_date) VALUES (?,?,?,?,?,datetime('now'))",
+                (sha, title, first_author, dataset, ocr_path)
+            )
+            count += 1
+
+        # Rebuild FTS index
+        db.execute("INSERT INTO papers_fts(papers_fts) VALUES('rebuild')")
+        db.commit()
+        total = db.execute("SELECT COUNT(*) FROM papers").fetchone()[0]
+        print(f"Audited {count} new papers. Total: {total} in papers.db")
+        db.close()
+
+    elif args.cmd == "search":
+        import sqlite3
+        db_path = RAW_DIR.parent / "papers.db"
+        if not db_path.exists():
+            print("papers.db not found. Run 'deposit audit' first.")
+            return
+        db = sqlite3.connect(str(db_path))
+        rows = db.execute(
+            """SELECT p.title, p.first_author, p.dataset, p.ocr_path
+               FROM papers_fts f JOIN papers p ON f.rowid = p.rowid
+               WHERE papers_fts MATCH ? LIMIT 20""",
+            (args.query,)
+        ).fetchall()
+        for row in rows:
+            print(f"{row[0][:70]:70s} | {row[1] or '?':20s} | {row[2] or '':15s}")
+        db.close()
 
 
 if __name__ == "__main__":
